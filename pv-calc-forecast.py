@@ -13,7 +13,6 @@ import pytz
 from datetime import datetime, timedelta
 from pathlib import Path
 from tabulate import tabulate
-from timezonefinder import TimezoneFinder
 from tzlocal import get_localzone
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -49,17 +48,18 @@ def parse_args_and_config():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             f'Configuration loaded from {pre_args.config} (if present).\n'
-            'Forecast sources: forecast-solar (default), open-meteo'
+            'Forecast sources: forecast-solar (default), open-meteo\n'
+            'Both --calculate and --forecast may be used together in one invocation.'
         )
     )
 
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument('--calculate', action='store_true',
-                            help='Clear-sky theoretical calculation via pvlib')
-    mode_group.add_argument('--forecast', nargs='?', const='forecast-solar',
-                            choices=['forecast-solar', 'open-meteo'],
-                            metavar='SOURCE',
-                            help='Forecast source: forecast-solar (default) or open-meteo')
+    # Both flags are independent — they can be combined
+    parser.add_argument('--calculate', action='store_true',
+                        help='Clear-sky theoretical calculation via pvlib')
+    parser.add_argument('--forecast', nargs='?', const='forecast-solar',
+                        choices=['forecast-solar', 'open-meteo'],
+                        metavar='SOURCE',
+                        help='Forecast source: forecast-solar (default) or open-meteo')
 
     parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to config file')
 
@@ -107,12 +107,15 @@ def parse_args_and_config():
 
     args = parser.parse_args()
 
-    # Mode-specific validation
-    if args.calculate:
-        if not any([args.now, args.time, args.timeframe]):
-            parser.error("--calculate requires one of: --now, --time, --timeframe")
+    # At least one mode required
+    if not args.calculate and args.forecast is None:
+        parser.error("at least one of --calculate or --forecast is required")
 
-    if args.forecast is not None:
+    # Mode-specific validation
+    if args.calculate and not any([args.now, args.time, args.timeframe]):
+        parser.error("--calculate requires one of: --now, --time, --timeframe")
+
+    if args.forecast is not None and not args.calculate:
         if any([args.now, args.time, args.timeframe]):
             parser.error("--now/--time/--timeframe are only valid with --calculate")
 
@@ -125,10 +128,13 @@ def parse_args_and_config():
     if missing:
         parser.error(f'required (via CLI or config.cfg): {", ".join(missing)}')
 
-    # Resolve timezone: explicit > derive from coordinates > system default
+    # Resolve timezone: explicit/config > derive from coordinates > system default
+    # TimezoneFinder is only imported when no timezone is configured — it loads a
+    # 20 MB database and costs ~4s on ARM, so we skip it whenever possible.
     if args.timezone:
         args.timezone = pytz.timezone(args.timezone)
     else:
+        from timezonefinder import TimezoneFinder
         tz_name = TimezoneFinder().timezone_at(lat=args.latitude, lng=args.longitude)
         args.timezone = pytz.timezone(tz_name) if tz_name else get_localzone()
 
@@ -351,7 +357,7 @@ def run_forecast_solar(args):
         args.latitude, args.longitude, args.system_capacity, cache
     )
     if is_cached:
-        print("# Using cached data (less than 1 hour old)", file=sys.stderr)
+        print("# Using cached forecast.solar data (less than 1 hour old)", file=sys.stderr)
 
     watts_tilted = _transpose_forecast_solar(args, data['result']['watts'])
     return _build_forecast_result(args, watts_tilted)
@@ -410,9 +416,8 @@ def _process_open_meteo(args, raw):
         dhi=dhi,
     )
 
-    # poa_global [W/m²] × system_capacity [kWp] = DC watts (at STC reference 1000 W/m²)
+    # poa_global [W/m²] × system_capacity [kWp] = DC watts (at STC 1000 W/m² reference)
     watts = (poa['poa_global'] * args.system_capacity).clip(lower=0).fillna(0)
-
     return {ts.strftime("%Y-%m-%d %H:%M:%S"): float(w) for ts, w in watts.items()}
 
 
@@ -422,7 +427,7 @@ def run_forecast_open_meteo(args):
         args.latitude, args.longitude, args.system_capacity, cache
     )
     if is_cached:
-        print("# Using cached data (less than 1 hour old)", file=sys.stderr)
+        print("# Using cached Open-Meteo data (less than 1 hour old)", file=sys.stderr)
 
     watts_tilted = _process_open_meteo(args, data)
     return _build_forecast_result(args, watts_tilted)
@@ -559,12 +564,23 @@ def format_prometheus(data, mode, args):
     return "\n".join(lines)
 
 
+def _render(result, mode, args):
+    if args.format == 'human':
+        return format_human(result, mode, args)
+    elif args.format == 'json':
+        return format_json(result, mode, args)
+    elif args.format == 'prometheus':
+        return format_prometheus(result, mode, args)
+
+
 # ===== Entry point =====
 
 def main():
     args = parse_args_and_config()
 
     try:
+        outputs = []
+
         if args.calculate:
             if args.now:
                 ts = datetime.now(args.timezone)
@@ -578,20 +594,16 @@ def main():
                 if not result:
                     print("No significant production in the specified timeframe.", file=sys.stderr)
                     sys.exit(0)
-            mode = 'calculate'
-        else:
+            outputs.append(_render(result, 'calculate', args))
+
+        if args.forecast is not None:
             if args.forecast == 'open-meteo':
                 result = run_forecast_open_meteo(args)
             else:
                 result = run_forecast_solar(args)
-            mode = 'forecast'
+            outputs.append(_render(result, 'forecast', args))
 
-        if args.format == 'human':
-            print(format_human(result, mode, args))
-        elif args.format == 'json':
-            print(format_json(result, mode, args))
-        elif args.format == 'prometheus':
-            print(format_prometheus(result, mode, args))
+        print("\n".join(outputs))
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
