@@ -2,4 +2,6 @@ pandas
 pvlib
 pytz
 tabulate
+timezonefinder
 tzlocal
+requests

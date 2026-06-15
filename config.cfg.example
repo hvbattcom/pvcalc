@@ -1,8 +1,11 @@
 [system]
-latitude = 41.000
-longitude = 22.000
+latitude        = 41.000
+longitude       = 22.000
 system_capacity = 10.0
-panel_tilt = 30.0
-panel_azimuth = 180.0
-timezone = Europe/Athens
-shortname = mysystem
+panel_tilt      = 30.0
+panel_azimuth   = 180.0
+shortname       = mysystem
+
+# Optional overrides (uncomment to enable)
+# timezone         = Europe/Athens   # auto-detected from coordinates if not set
+# show_current_hour = false          # forecast mode: also emit next-hour metric

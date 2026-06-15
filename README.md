@@ -1,15 +1,16 @@
-# PV Calculator
+# pv-calc-forecast
 
-A Python script for calculating theoretical PV DC production under clear sky conditions. This tool uses the `pvlib` library to estimate solar panel output based on location, system specifications, and time.
+A single CLI tool for solar PV **clear-sky calculation** and **weather-based forecasting**, powered by [pvlib](https://pvlib-python.readthedocs.io) and the [forecast.solar](https://forecast.solar) API.
+
+Both modes share the same system parameters (location, capacity, tilt, azimuth). Timezone is **auto-detected from coordinates** — no need to specify it manually.
 
 ## Features
 
-- Calculate theoretical DC power output for solar PV systems
-- Support for instant, specific time, and timeframe calculations
-- Multiple output formats (table, JSON, Prometheus metrics)
-- Timezone-aware calculations using system or specified timezone
-- Configurable time resolution for timeframe calculations
-- Optional `config.cfg` file for storing default system parameters
+- **Calculate mode** — theoretical DC output under clear-sky conditions via pvlib
+- **Forecast mode** — real weather forecast from forecast.solar API, with local pvlib transposition to your actual tilt/azimuth
+- Forecast caching (1 hour TTL) — one cache entry per location regardless of tilt/azimuth
+- Output formats: human-readable table, JSON, Prometheus metrics
+- `config.cfg` for storing default system parameters
 
 ## Requirements
 
@@ -19,125 +20,192 @@ pip install -r requirements.txt
 
 ## Configuration
 
-System parameters can be stored in `config.cfg` so you don't need to pass them on every invocation. Command-line arguments always override config file values.
+Store your system parameters in `config.cfg` (see `config.cfg.example`) so you don't need to pass them on every invocation. CLI arguments always take precedence over config values.
 
 ```ini
 [system]
-latitude = 41.000
-longitude = 22.000
+latitude        = 41.000
+longitude       = 22.000
 system_capacity = 10.0
-panel_tilt = 30.0
-panel_azimuth = 180.0
-timezone = Europe/Athens
-shortname = mysystem
+panel_tilt      = 30.0
+panel_azimuth   = 180.0
+shortname       = mysystem
 ```
 
-A custom config file path can be specified with `--config /path/to/config.cfg`.
+A custom config path can be specified with `--config /path/to/config.cfg`.
 
 ## Usage
 
-### Basic Usage
+```
+pv-calc-forecast.py (--calculate | --forecast) [options]
+```
+
+### Calculate mode
+
+Uses pvlib to compute theoretical DC output under clear-sky conditions.
 
 ```bash
-./pvcalc.py --now
+# Current moment
+./pv-calc-forecast.py --calculate --now
+
+# Specific time
+./pv-calc-forecast.py --calculate --time "2024-06-15 12:00"
+
+# Date range (hourly by default)
+./pv-calc-forecast.py --calculate --timeframe "2024-06-15:2024-06-16"
+
+# Date range at 30-minute resolution
+./pv-calc-forecast.py --calculate --timeframe "2024-06-15:2024-06-16" --resolution 30min
 ```
 
-If `config.cfg` is present, the system parameters are loaded from it. Without a config file, all system parameters must be supplied on the command line:
+**Calculate-only options:**
+
+| Option | Description |
+|--------|-------------|
+| `--now` | Use current time |
+| `--time YYYY-MM-DD HH:MM` | Specific timestamp |
+| `--timeframe YYYY-MM-DD:YYYY-MM-DD` | Date range |
+| `--resolution` | `1min`, `10min`, `20min`, `30min`, `1H` (default: `1H`) |
+
+### Forecast mode
+
+Fetches a weather-based solar forecast and transposes it to your actual panel tilt/azimuth using pvlib. Two sources are available:
+
+| Source | Flag | Horizon | Rate limit | Transposition |
+|--------|------|---------|------------|---------------|
+| forecast.solar | `--forecast` or `--forecast=forecast-solar` | ~2 days | 12 req/h (free) | ratio method via clear-sky |
+| Open-Meteo | `--forecast=open-meteo` | 7 days | none | exact (real DNI/DHI) |
+
+Both sources share the same cache TTL (1 hour) with separate files per source. The cache key excludes tilt/azimuth, so changing those values never requires a new API call.
 
 ```bash
-./pvcalc.py --latitude <lat> --longitude <lon> --system-capacity <kW> --panel-tilt <degrees> --panel-azimuth <degrees> [options]
+# forecast.solar (default)
+./pv-calc-forecast.py --forecast
+
+# Open-Meteo (7-day horizon, no rate limit, exact transposition)
+./pv-calc-forecast.py --forecast=open-meteo
+
+# Also include next-hour power
+./pv-calc-forecast.py --forecast=open-meteo --show-current-hour
 ```
 
-### Time Options
+**Forecast-only options:**
 
-- Current time:
-```bash
---now
-# or
---time=now
+| Option | Description |
+|--------|-------------|
+| `--show-current-hour` | Also emit next-hour power metric |
+| `--hourly-window START-END` | Minutes within each hour to emit full hourly data (default: `0-5`) |
+
+### Shared options
+
+| Option | Description |
+|--------|-------------|
+| `--latitude` | Location latitude |
+| `--longitude` | Location longitude |
+| `--system-capacity` | System capacity in kWp |
+| `--panel-tilt` | Panel tilt in degrees |
+| `--panel-azimuth` | Panel azimuth in degrees (180 = South, 90 = East, 270 = West) |
+| `--shortname` | Short label for the system |
+| `--timezone` | Override timezone (auto-detected from coordinates if omitted) |
+| `--format` | `human` (default), `json`, `prometheus` |
+| `--config` | Path to config file |
+
+## Output formats
+
+### Human (default)
+
+Calculate mode — single point:
+```
+--------------  ---------------------
+Time            2024-06-15 12:00 EEST
+DC Power        8.59 kW
+POA Irradiance  858.82 W/m²
+GHI             849.22 W/m²
+--------------  ---------------------
 ```
 
-- Specific time:
-```bash
---time "2024-03-20 12:00"
+Calculate mode — timeframe:
+```
+Time                   DC Power (kW)    POA Irr (W/m²)    GHI (W/m²)
+---------------------  ---------------  ----------------  ------------
+2024-06-15 08:00 EEST             1.64            163.74        235.82
+2024-06-15 09:00 EEST             3.60            359.59        423.89
+...
 ```
 
-- Time range:
-```bash
---timeframe "2024-03-20:2024-03-21"
+Forecast mode:
+```
+Date          Energy (Wh)
+----------  -------------
+2024-06-15        56,848
+2024-06-16        54,711
+
+Hour              Power (W)
+----------------  -----------
+2024-06-15 08:00       1,462
+2024-06-15 09:00       3,175
+...
 ```
 
-### Optional Parameters
+### JSON
 
-- `--config`: Path to config file (default: `config.cfg` next to the script)
-- `--timezone`: Timezone name (default: value from config, or system timezone)
-- `--shortname`: Short identifier for the system (default: value from config)
-- `--resolution`: Time resolution for timeframe calculations (1min, 10min, 20min, 30min, 1H)
-- `--format`: Output format (table, json, prometheus)
-
-### Examples
-
-1. Get current production using values from `config.cfg`:
-```bash
-./pvcalc.py --now
-```
-
-2. Override a single parameter from the config:
-```bash
-./pvcalc.py --now --system-capacity 12.0
-```
-
-3. Get current production in table format (no config file):
-```bash
-./pvcalc.py --latitude 41.000 --longitude 22.000 --system-capacity 10.0 --panel-tilt 30.0 --panel-azimuth 180.0 --now
-```
-
-4. Get production for specific time in JSON format:
-```bash
-./pvcalc.py --time "2024-03-20 12:00" --format json
-```
-
-5. Get production in Prometheus format with a custom config file:
-```bash
-./pvcalc.py --now --format prometheus --config /etc/pvcalc/site2.cfg
-```
-
-6. Get production over a timeframe:
-```bash
-./pvcalc.py --timeframe "2024-03-20:2024-03-21" --resolution 30min
-```
-
-## Output Formats
-
-### Table Format (default)
-```
-Time                DC Power    POA Irr    GHI
-------------------  ----------  ---------  --------
-2024-03-20 12:00   5.23 kW     850 W/m²   750 W/m²
-```
-
-### JSON Format
+Calculate mode:
 ```json
 {
-  "timestamp": "2024-03-20 12:00 EET",
-  "dc_power_kw": 5.23,
-  "poa_irradiance": 850.0,
-  "ghi": 750.0
+  "timestamp": "2024-06-15 12:00 EEST",
+  "dc_power_watts": 8588.15,
+  "poa_irradiance": 858.82,
+  "ghi": 849.22
 }
 ```
 
-### Prometheus Format
+Forecast mode:
+```json
+{
+  "watt_hours_day": {
+    "2024-06-15": 56848,
+    "2024-06-16": 54711
+  },
+  "watts_tilted": {
+    "2024-06-15 08:00:00": 1462,
+    "2024-06-15 09:00:00": 3175
+  }
+}
 ```
-theoretical_pv_watts{shortname="mysystem",plant="theoretical",capacity="10.0"} 5230.00
+
+### Prometheus
+
+Calculate mode:
+```
+theoretical_pv_watts{shortname="mysystem",plant="theoretical",capacity="10.0"} 8588.15
+```
+
+Forecast mode:
+```
+# HELP solar_forecast_watt_hours_day Forecasted solar energy production in watt-hours per day
+# TYPE solar_forecast_watt_hours_day gauge
+solar_forecast_watt_hours_day{forecast="solar",shortname="mysystem",date="2024-06-15"} 56848
+
+# HELP solar_forecast_hour_watts Forecasted solar power output per hour in watts, labelled by date and hour
+# TYPE solar_forecast_hour_watts gauge
+solar_forecast_hour_watts{shortname="mysystem",date="2024-06-15",hour="08:00"} 1462
+solar_forecast_hour_watts{shortname="mysystem",date="2024-06-15",hour="09:00"} 3175
+
+# HELP solar_forecast_current_hour_watts Forecasted solar power output for the current hour in watts
+# TYPE solar_forecast_current_hour_watts gauge
+solar_forecast_current_hour_watts{forecast="hourly",shortname="mysystem"} 3175
 ```
 
 ## Notes
 
-- Panel azimuth angle: 180° represents South, 90° East, 270° West
-- Timeframe calculations filter out negligible production values (< 0.001 kW)
-- All calculations assume clear sky conditions
-- Time values are timezone-aware
+- Timezone is auto-detected from latitude/longitude using `timezonefinder`; use `--timezone` only to override
+- Panel azimuth: 180° = South, 90° = East, 270° = West
+- Calculate mode filters out negligible production values (< 0.001 kW)
+- Calculate mode assumes clear-sky conditions
+- Forecast mode daily totals are summed from the transposed hourly values, not taken from the raw API response
+- Open-Meteo uses actual DNI/DHI from its NWP model for an exact pvlib transposition; forecast.solar uses a clear-sky ratio approximation (the API only exposes total watts, not irradiance components)
+- The `--hourly-window` gate limits when the full hourly data block is emitted (useful for Prometheus scrapers to avoid redundant data)
 
 ## License
 
-This project is open-sourced under the MIT license.
+MIT
