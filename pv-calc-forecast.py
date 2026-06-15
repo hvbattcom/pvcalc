@@ -48,7 +48,7 @@ def parse_args_and_config():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             f'Configuration loaded from {pre_args.config} (if present).\n'
-            'Forecast sources: forecast-solar (default), open-meteo\n'
+            'Forecast sources: forecast-solar (default), open-meteo, solcast\n'
             'Both --calculate and --forecast may be used together in one invocation.'
         )
     )
@@ -57,9 +57,9 @@ def parse_args_and_config():
     parser.add_argument('--calculate', action='store_true',
                         help='Clear-sky theoretical calculation via pvlib')
     parser.add_argument('--forecast', nargs='?', const='forecast-solar',
-                        choices=['forecast-solar', 'open-meteo'],
+                        choices=['forecast-solar', 'open-meteo', 'solcast'],
                         metavar='SOURCE',
-                        help='Forecast source: forecast-solar (default) or open-meteo')
+                        help='Forecast source: forecast-solar (default), open-meteo, or solcast')
 
     parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to config file')
 
@@ -104,6 +104,12 @@ def parse_args_and_config():
                         help='Minutes within each hour to emit full hourly data (default: 0-5)')
     parser.add_argument('--show-days', type=int, default=3, metavar='N',
                         help='Number of days to include in forecast output (default: 3)')
+    parser.add_argument('--solcast-api-key',
+                        default=cfg.get('solcast_api_key'),
+                        help='Solcast API key (or set solcast_api_key in config.cfg)')
+    parser.add_argument('--solcast-resource-id',
+                        default=cfg.get('solcast_resource_id'),
+                        help='Solcast rooftop site resource ID (auto-detected if only one site exists)')
 
     args = parser.parse_args()
 
@@ -118,6 +124,9 @@ def parse_args_and_config():
     if args.forecast is not None and not args.calculate:
         if any([args.now, args.time, args.timeframe]):
             parser.error("--now/--time/--timeframe are only valid with --calculate")
+
+    if args.forecast == 'solcast' and not args.solcast_api_key:
+        parser.error("--forecast=solcast requires --solcast-api-key or solcast_api_key in config.cfg")
 
     # Required system parameters
     missing = [f'--{k.replace("_", "-")}' for k, v in [
@@ -206,8 +215,9 @@ def calculate_timeframe_production(args):
 class ForecastCache:
     """Cache keyed by (lat, lon, kwp); prefix distinguishes the source."""
 
-    def __init__(self, prefix):
+    def __init__(self, prefix, ttl=CACHE_TTL):
         self.prefix = prefix
+        self.ttl = ttl
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _path(self, lat, lon, kwp):
@@ -222,7 +232,7 @@ class ForecastCache:
                 if ignore_age:
                     print(f"# Using cached data ({int(age / 60)} min old) due to rate limit", file=sys.stderr)
                     return cached['data'], True
-                if age < CACHE_TTL:
+                if age < self.ttl:
                     return cached['data'], True
         except Exception as e:
             print(f"Cache read error: {e}", file=sys.stderr)
@@ -433,6 +443,137 @@ def run_forecast_open_meteo(args):
     return _build_forecast_result(args, watts_tilted)
 
 
+# ===== Forecast source: Solcast =====
+
+SOLCAST_TTL = 14400  # 4 hours — free tier allows 10 forecast API calls/day
+
+
+def _list_solcast_sites(api_key):
+    """List registered Solcast rooftop sites; cached for 24 hours."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / "solcast_sites.json"
+    try:
+        if path.exists():
+            cached = json.loads(path.read_text())
+            if time.time() - cached['cache_timestamp'] < 86400:
+                return cached['data']
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(
+            "https://api.solcast.com.au/rooftop_sites?format=json",
+            headers={'Authorization': f'Bearer {api_key}'}
+        )
+        if response.status_code in (401, 403):
+            print("Error: Solcast API key rejected. Check your key at solcast.com.", file=sys.stderr)
+            sys.exit(1)
+        response.raise_for_status()
+        sites = response.json().get('sites', [])
+        try:
+            path.write_text(json.dumps({'cache_timestamp': time.time(), 'data': sites}))
+        except Exception as e:
+            print(f"Cache write error: {e}", file=sys.stderr)
+        return sites
+    except requests.exceptions.RequestException as e:
+        print(f"Error listing Solcast sites: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _fetch_solcast_rooftop(resource_id, api_key):
+    """Fetch rooftop forecast for a Solcast resource_id; 4-hour cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / f"solcast_{resource_id}.json"
+
+    try:
+        if path.exists():
+            cached = json.loads(path.read_text())
+            if time.time() - cached['cache_timestamp'] < SOLCAST_TTL:
+                return cached['data'], True
+    except Exception as e:
+        print(f"Cache read error: {e}", file=sys.stderr)
+
+    url = f"https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts?hours=168&format=json"
+    try:
+        response = requests.get(url, headers={'Authorization': f'Bearer {api_key}'})
+        if response.status_code in (401, 403):
+            print("Error: Solcast API key rejected (401/403). Check your key or account plan.", file=sys.stderr)
+            sys.exit(1)
+        if response.status_code == 429:
+            if path.exists():
+                try:
+                    cached = json.loads(path.read_text())
+                    age = time.time() - cached['cache_timestamp']
+                    print(f"# Rate limit hit — using cached Solcast data ({int(age / 60)} min old)", file=sys.stderr)
+                    return cached['data'], True
+                except Exception:
+                    pass
+            print("Error: Solcast daily API limit reached (10 calls/day on free tier)", file=sys.stderr)
+            sys.exit(1)
+        response.raise_for_status()
+        data = response.json()
+        try:
+            path.write_text(json.dumps({'cache_timestamp': time.time(), 'data': data}))
+        except Exception as e:
+            print(f"Cache write error: {e}", file=sys.stderr)
+        return data, False
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching Solcast data: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _process_solcast_rooftop(args, raw):
+    """
+    Convert Solcast pv_estimate (kW per 30-min period) to hourly watts.
+    pv_estimate is already computed for the site's tilt/azimuth as registered on
+    Solcast — no pvlib transposition needed. Sub-hourly periods are averaged per hour.
+    """
+    half_hours = []
+    for entry in raw['forecasts']:
+        period_end = pd.Timestamp(entry['period_end']).tz_convert(args.timezone)
+        minutes = 60 if entry.get('period') == 'PT60M' else 30
+        period_start = period_end - pd.Timedelta(minutes=minutes)
+        half_hours.append((period_start, float(entry.get('pv_estimate') or 0)))
+
+    hourly = {}
+    for start, kw in half_hours:
+        hour_ts = start.replace(minute=0, second=0, microsecond=0)
+        hourly.setdefault(hour_ts, []).append(kw)
+
+    return {
+        ts.strftime("%Y-%m-%d %H:%M:%S"): sum(kw_list) / len(kw_list) * 1000
+        for ts, kw_list in sorted(hourly.items())
+    }
+
+
+def run_forecast_solcast(args):
+    resource_id = args.solcast_resource_id
+    if not resource_id:
+        sites = _list_solcast_sites(args.solcast_api_key)
+        if not sites:
+            print("Error: No Solcast rooftop sites found. Register one at solcast.com.", file=sys.stderr)
+            sys.exit(1)
+        if len(sites) > 1:
+            site_list = "\n".join(
+                f"  {s['resource_id']}: {s.get('name', '')} ({s.get('location', '')})"
+                for s in sites
+            )
+            print(
+                f"Error: Multiple Solcast sites found. Specify one with --solcast-resource-id "
+                f"or solcast_resource_id in config.cfg:\n{site_list}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        resource_id = sites[0]['resource_id']
+
+    data, is_cached = _fetch_solcast_rooftop(resource_id, args.solcast_api_key)
+    if is_cached:
+        print("# Using cached Solcast data (less than 4 hours old)", file=sys.stderr)
+
+    watts_tilted = _process_solcast_rooftop(args, data)
+    return _build_forecast_result(args, watts_tilted)
+
+
 # ===== Output formatters =====
 
 def _label_str(labels):
@@ -461,27 +602,24 @@ def format_human(data, mode, args):
                         headers=["Time", "DC Power (kW)", "POA Irr (W/m²)", "GHI (W/m²)"],
                         tablefmt="simple")
 
-    # Forecast mode
+    # Forecast mode — hourly table always shown for human format
     lines = []
     daily_rows = [[date, f"{int(wh):,}"]
                   for date, wh in sorted(data['watt_hours_day'].items())]
     lines.append(tabulate(daily_rows, headers=["Date", "Energy (Wh)"], tablefmt="simple"))
 
-    current_minute = datetime.now().minute
-    hw = args.hourly_window
-    if hw[0] <= current_minute <= hw[1]:
-        hourly_rows = []
-        for ts_str, watts in sorted(data['watts_tilted'].items()):
-            try:
-                dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                continue
-            if dt.minute != 0 or dt.second != 0:
-                continue
-            hourly_rows.append([dt.strftime('%Y-%m-%d %H:00'), f"{int(watts):,}"])
-        if hourly_rows:
-            lines.append("")
-            lines.append(tabulate(hourly_rows, headers=["Hour", "Power (W)"], tablefmt="simple"))
+    hourly_rows = []
+    for ts_str, watts in sorted(data['watts_tilted'].items()):
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if dt.minute != 0 or dt.second != 0:
+            continue
+        hourly_rows.append([dt.strftime('%Y-%m-%d %H:00'), f"{int(watts):,}"])
+    if hourly_rows:
+        lines.append("")
+        lines.append(tabulate(hourly_rows, headers=["Hour", "Power (W)"], tablefmt="simple"))
 
     if data['current_hour_watts'] is not None:
         lines.append(f"\nNext hour: {int(data['current_hour_watts']):,} W")
@@ -599,6 +737,8 @@ def main():
         if args.forecast is not None:
             if args.forecast == 'open-meteo':
                 result = run_forecast_open_meteo(args)
+            elif args.forecast == 'solcast':
+                result = run_forecast_solcast(args)
             else:
                 result = run_forecast_solar(args)
             outputs.append(_render(result, 'forecast', args))

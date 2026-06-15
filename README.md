@@ -69,14 +69,17 @@ Uses pvlib to compute theoretical DC output under clear-sky conditions.
 
 ### Forecast mode
 
-Fetches a weather-based solar forecast and transposes it to your actual panel tilt/azimuth using pvlib. Two sources are available:
+Fetches a weather-based solar forecast. Three sources are available:
 
-| Source | Flag | Horizon | Rate limit | Transposition |
-|--------|------|---------|------------|---------------|
-| forecast.solar | `--forecast` or `--forecast=forecast-solar` | ~2 days | 12 req/h (free) | ratio method via clear-sky |
-| Open-Meteo | `--forecast=open-meteo` | 7 days | none | exact (real DNI/DHI) |
+| Source | Flag | Horizon | Rate limit | Auth | Transposition |
+|--------|------|---------|------------|------|---------------|
+| forecast.solar | `--forecast` or `--forecast=forecast-solar` | ~2 days | 12 req/h (free) | none | ratio method via clear-sky |
+| Open-Meteo | `--forecast=open-meteo` | 7 days | none | none | exact (real DNI/DHI) |
+| Solcast | `--forecast=solcast` | 7 days | 10 calls/day (free) | API key | pre-computed by Solcast |
 
-Both sources share the same cache TTL (1 hour) with separate files per source. The cache key excludes tilt/azimuth, so changing those values never requires a new API call.
+forecast.solar and Open-Meteo transpose the forecast to your actual panel tilt/azimuth using pvlib. Solcast uses the tilt/azimuth and capacity you registered in your [Solcast account](https://solcast.com) — no local transposition is performed.
+
+All sources cache results locally. Cache TTL: 1 hour for forecast.solar and Open-Meteo, 4 hours for Solcast.
 
 ```bash
 # forecast.solar (default)
@@ -84,6 +87,9 @@ Both sources share the same cache TTL (1 hour) with separate files per source. T
 
 # Open-Meteo (7-day horizon, no rate limit, exact transposition)
 ./pv-calc-forecast.py --forecast=open-meteo
+
+# Solcast (requires a registered rooftop site and API key)
+./pv-calc-forecast.py --forecast=solcast --solcast-api-key=YOUR_KEY
 
 # Also include next-hour power
 ./pv-calc-forecast.py --forecast=open-meteo --show-current-hour
@@ -93,8 +99,11 @@ Both sources share the same cache TTL (1 hour) with separate files per source. T
 
 | Option | Description |
 |--------|-------------|
-| `--show-current-hour` | Also emit next-hour power metric |
-| `--hourly-window START-END` | Minutes within each hour to emit full hourly data (default: `0-5`) |
+| `--show-current-hour` | Also emit next-hour power forecast metric |
+| `--hourly-window START-END` | Minutes within each hour to emit full hourly data in Prometheus format (default: `0-5`) |
+| `--show-days N` | Number of days to include in forecast output (default: 3) |
+| `--solcast-api-key KEY` | Solcast API key (or `solcast_api_key` in config.cfg) |
+| `--solcast-resource-id ID` | Solcast rooftop site resource ID (auto-detected if only one site is registered) |
 
 ### Shared options
 
@@ -198,13 +207,26 @@ solar_forecast_current_hour_watts{forecast="hourly",shortname="mysystem"} 3175
 
 ## Notes
 
-- Timezone is auto-detected from latitude/longitude using `timezonefinder`; use `--timezone` only to override
+- Timezone is auto-detected from latitude/longitude using `timezonefinder`; use `--timezone` only to override, or set `timezone` in config.cfg to avoid the 4-second startup cost on ARM boards
 - Panel azimuth: 180° = South, 90° = East, 270° = West
 - Calculate mode filters out negligible production values (< 0.001 kW)
 - Calculate mode assumes clear-sky conditions
 - Forecast mode daily totals are summed from the transposed hourly values, not taken from the raw API response
 - Open-Meteo uses actual DNI/DHI from its NWP model for an exact pvlib transposition; forecast.solar uses a clear-sky ratio approximation (the API only exposes total watts, not irradiance components)
-- The `--hourly-window` gate limits when the full hourly data block is emitted (useful for Prometheus scrapers to avoid redundant data)
+- Solcast rooftop forecasts use the tilt, azimuth and capacity configured in your Solcast account dashboard — `--panel-tilt`, `--panel-azimuth`, and `--system-capacity` are not applied to Solcast output
+- Solcast free tier: 10 API calls/day — results are cached for 4 hours; expired cache is used on rate-limit errors
+- `--hourly-window` only gates the hourly block in Prometheus format (useful for Prometheus scrapers); human and JSON output always include the full hourly table
+
+## Solcast setup
+
+1. Create a free account at [solcast.com](https://solcast.com)
+2. Register your rooftop site with its actual tilt, azimuth and capacity
+3. Copy your API key from the account dashboard
+4. Add to `config.cfg`:
+   ```ini
+   solcast_api_key   = your-key-here
+   # solcast_resource_id = b1e1-c590-b64e-dc50  # optional: auto-detected if only one site
+   ```
 
 ## License
 

@@ -7,5 +7,7 @@ panel_azimuth   = 180.0
 shortname       = mysystem
 
 # Optional overrides (uncomment to enable)
-# timezone         = Europe/Athens   # auto-detected from coordinates if not set
-# show_current_hour = false          # forecast mode: also emit next-hour metric
+# timezone          = Europe/Athens      # auto-detected from coordinates if not set
+# show_current_hour = false              # forecast mode: also emit next-hour metric
+# solcast_api_key   = your-key-here     # required for --forecast=solcast
+# solcast_resource_id = b1e1-c590-b64e-dc50  # auto-detected if only one site registered
