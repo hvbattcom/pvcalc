@@ -1,13 +1,44 @@
 [system]
-latitude        = 41.000
-longitude       = 22.000
-system_capacity = 10.0
-panel_tilt      = 30.0
-panel_azimuth   = 180.0
-shortname       = mysystem
+latitude  = 41.000
+longitude = 22.000
+timezone  = Europe/Athens     # auto-detected from coordinates if not set
 
-# Optional overrides (uncomment to enable)
-# timezone          = Europe/Athens      # auto-detected from coordinates if not set
-# show_current_hour = false              # forecast mode: also emit next-hour metric
-# solcast_api_key   = your-key-here     # required for --forecast=solcast
-# solcast_resource_id = b1e1-c590-b64e-dc50  # auto-detected if only one site registered
+# Forecast behaviour
+# show_current_hour = false   # also emit next-hour metric
+# hourly_window     = 0-5     # minutes past the hour to emit full hourly data
+# solcast_api_key   = your-key-here
+
+# ── Multi-string mode ────────────────────────────────────────────────────────
+# Define one section per panel array. Section names become the `string=` label
+# in Prometheus output. Any section name other than [system]/[solar] is treated
+# as a PV string.
+
+[PV1]
+capacity = 15.0   # kWp
+tilt     = 30     # degrees from horizontal
+azimuth  = 205    # degrees clockwise from North (180 = South)
+
+[PV2]
+capacity = 10.0
+tilt     = 25
+azimuth  = 90
+
+[PV3]
+capacity = 5.0
+tilt     = 25
+azimuth  = 270
+
+# Optional: per-string Solcast resource ID (only needed for --forecast=solcast)
+# solcast_resource_id = b1e1-c590-b64e-dc50
+
+
+# ── Single-string mode (alternative to PV sections above) ───────────────────
+# Used when no [PV*] sections are defined. Parameters can also be passed via CLI.
+#
+# [system]
+# latitude        = 41.000
+# longitude       = 22.000
+# system_capacity = 10.0
+# panel_tilt      = 30.0
+# panel_azimuth   = 180.0
+# shortname       = mysystem

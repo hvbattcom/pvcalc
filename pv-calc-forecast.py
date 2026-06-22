@@ -19,6 +19,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_CONFIG = SCRIPT_DIR / "config.cfg"
 CACHE_DIR = SCRIPT_DIR / ".cache"
 CACHE_TTL = 3600
+RESERVED_SECTIONS = {'system', 'solar', 'DEFAULT'}
 
 
 # ===== Config =====
@@ -27,11 +28,11 @@ def load_config(config_path):
     cfg = configparser.ConfigParser()
     cfg.read(config_path)
     if 'system' in cfg:
-        return dict(cfg['system'])
+        return dict(cfg['system']), cfg
     if 'solar' in cfg:
         print("Warning: [solar] config section is deprecated, rename it to [system]", file=sys.stderr)
-        return dict(cfg['solar'])
-    return {}
+        return dict(cfg['solar']), cfg
+    return {}, cfg
 
 
 # ===== Argument parsing =====
@@ -41,7 +42,7 @@ def parse_args_and_config():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config', default=str(DEFAULT_CONFIG))
     pre_args, _ = pre.parse_known_args()
-    cfg = load_config(pre_args.config)
+    cfg, full_cfg = load_config(pre_args.config)
 
     parser = argparse.ArgumentParser(
         description='PV clear-sky calculation and solar forecast tool',
@@ -63,28 +64,30 @@ def parse_args_and_config():
 
     parser.add_argument('--config', default=str(DEFAULT_CONFIG), help='Path to config file')
 
-    # Shared system parameters
+    # Site-level parameters (always required)
     parser.add_argument('--latitude', type=float,
                         default=float(cfg['latitude']) if 'latitude' in cfg else None,
                         help='Location latitude')
     parser.add_argument('--longitude', type=float,
                         default=float(cfg['longitude']) if 'longitude' in cfg else None,
                         help='Location longitude')
-    parser.add_argument('--system-capacity', type=float,
-                        default=float(cfg['system_capacity']) if 'system_capacity' in cfg else None,
-                        help='System capacity in kWp')
-    parser.add_argument('--panel-tilt', type=float,
-                        default=float(cfg['panel_tilt']) if 'panel_tilt' in cfg else None,
-                        help='Panel tilt in degrees')
-    parser.add_argument('--panel-azimuth', type=float,
-                        default=float(cfg['panel_azimuth']) if 'panel_azimuth' in cfg else None,
-                        help='Panel azimuth in degrees (180 = South)')
-    parser.add_argument('--shortname', default=cfg.get('shortname'),
-                        help='Short identifier for the system')
     parser.add_argument('--timezone', default=cfg.get('timezone'),
                         help='Override timezone (auto-detected from coordinates if omitted)')
     parser.add_argument('--format', choices=['human', 'json', 'prometheus'], default='human',
                         help='Output format (default: human)')
+
+    # Single-string mode parameters (used when no [PV*] sections exist in config)
+    parser.add_argument('--system-capacity', type=float,
+                        default=float(cfg['system_capacity']) if 'system_capacity' in cfg else None,
+                        help='System capacity in kWp (single-string mode)')
+    parser.add_argument('--panel-tilt', type=float,
+                        default=float(cfg['panel_tilt']) if 'panel_tilt' in cfg else None,
+                        help='Panel tilt in degrees (single-string mode)')
+    parser.add_argument('--panel-azimuth', type=float,
+                        default=float(cfg['panel_azimuth']) if 'panel_azimuth' in cfg else None,
+                        help='Panel azimuth in degrees, 180=South (single-string mode)')
+    parser.add_argument('--shortname', default=cfg.get('shortname'),
+                        help='Short identifier used as string name in single-string mode')
 
     # Calculate-only options
     time_group = parser.add_mutually_exclusive_group()
@@ -100,7 +103,7 @@ def parse_args_and_config():
     show_hour_default = cfg.get('show_current_hour', 'false').lower() == 'true'
     parser.add_argument('--show-current-hour', action='store_true', default=show_hour_default,
                         help='Also emit next-hour power forecast metric')
-    parser.add_argument('--hourly-window', default='0-5',
+    parser.add_argument('--hourly-window', default=cfg.get('hourly_window', '0-5'),
                         help='Minutes within each hour to emit full hourly data (default: 0-5)')
     parser.add_argument('--show-days', type=int, default=3, metavar='N',
                         help='Number of days to include in forecast output (default: 3)')
@@ -117,7 +120,6 @@ def parse_args_and_config():
     if not args.calculate and args.forecast is None:
         parser.error("at least one of --calculate or --forecast is required")
 
-    # Mode-specific validation
     if args.calculate and not any([args.now, args.time, args.timeframe]):
         parser.error("--calculate requires one of: --now, --time, --timeframe")
 
@@ -128,14 +130,44 @@ def parse_args_and_config():
     if args.forecast == 'solcast' and not args.solcast_api_key:
         parser.error("--forecast=solcast requires --solcast-api-key or solcast_api_key in config.cfg")
 
-    # Required system parameters
-    missing = [f'--{k.replace("_", "-")}' for k, v in [
-        ('latitude', args.latitude), ('longitude', args.longitude),
-        ('system_capacity', args.system_capacity),
-        ('panel_tilt', args.panel_tilt), ('panel_azimuth', args.panel_azimuth),
+    # Site-level params always required
+    missing_site = [f'--{k}' for k, v in [
+        ('latitude', args.latitude), ('longitude', args.longitude)
     ] if v is None]
-    if missing:
-        parser.error(f'required (via CLI or config.cfg): {", ".join(missing)}')
+    if missing_site:
+        parser.error(f'required (via CLI or config.cfg): {", ".join(missing_site)}')
+
+    # Build string list from [PV*] config sections, or fall back to single-string CLI params
+    pv_sections = [s for s in full_cfg.sections() if s not in RESERVED_SECTIONS]
+    if pv_sections:
+        args.strings = []
+        for name in pv_sections:
+            sec = full_cfg[name]
+            try:
+                args.strings.append({
+                    'name': name,
+                    'capacity': float(sec['capacity']),
+                    'tilt': float(sec['tilt']),
+                    'azimuth': float(sec['azimuth']),
+                    'solcast_resource_id': sec.get('solcast_resource_id'),
+                })
+            except KeyError as e:
+                parser.error(f"[{name}] section missing required key: {e}")
+    else:
+        missing = [f'--{k.replace("_", "-")}' for k, v in [
+            ('system_capacity', args.system_capacity),
+            ('panel_tilt', args.panel_tilt),
+            ('panel_azimuth', args.panel_azimuth),
+        ] if v is None]
+        if missing:
+            parser.error(f'required (via CLI or config.cfg): {", ".join(missing)}')
+        args.strings = [{
+            'name': args.shortname or 'pv',
+            'capacity': args.system_capacity,
+            'tilt': args.panel_tilt,
+            'azimuth': args.panel_azimuth,
+            'solcast_resource_id': args.solcast_resource_id,
+        }]
 
     # Resolve timezone: explicit/config > derive from coordinates > system default
     # TimezoneFinder is only imported when no timezone is configured — it loads a
@@ -170,7 +202,7 @@ def get_time_range(timeframe, resolution, timezone):
     return pd.date_range(start=start, end=end, freq=freq)
 
 
-def calculate_production(args, timestamp):
+def calculate_production(args, timestamp, string):
     location = pvlib.location.Location(
         latitude=args.latitude, longitude=args.longitude, tz=str(args.timezone)
     )
@@ -183,15 +215,15 @@ def calculate_production(args, timestamp):
     solar_pos = location.get_solarposition(times)
     clearsky = location.get_clearsky(times)
     poa = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=args.panel_tilt,
-        surface_azimuth=args.panel_azimuth,
+        surface_tilt=string['tilt'],
+        surface_azimuth=string['azimuth'],
         dni=clearsky['dni'],
         ghi=clearsky['ghi'],
         dhi=clearsky['dhi'],
         solar_zenith=solar_pos['apparent_zenith'],
         solar_azimuth=solar_pos['azimuth']
     )
-    dc_power = poa['poa_global'] * args.system_capacity / 1000
+    dc_power = poa['poa_global'] * string['capacity'] / 1000
     return {
         'timestamp': timestamp,
         'ghi': float(clearsky['ghi'].iloc[0]),
@@ -200,11 +232,11 @@ def calculate_production(args, timestamp):
     }
 
 
-def calculate_timeframe_production(args):
+def calculate_timeframe_production(args, string):
     times = get_time_range(args.timeframe, args.resolution, args.timezone)
     results = []
     for ts in times:
-        r = calculate_production(args, ts)
+        r = calculate_production(args, ts, string)
         if r['dc_power_kw'] > 0.001:
             results.append(r)
     return results
@@ -213,18 +245,21 @@ def calculate_timeframe_production(args):
 # ===== Shared forecast helpers =====
 
 class ForecastCache:
-    """Cache keyed by (lat, lon, kwp); prefix distinguishes the source."""
+    """Cache keyed by (lat, lon) with optional suffix; prefix distinguishes the source."""
 
     def __init__(self, prefix, ttl=CACHE_TTL):
         self.prefix = prefix
         self.ttl = ttl
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, lat, lon, kwp):
-        return CACHE_DIR / f"{self.prefix}_{lat}_{lon}_{kwp}.json"
+    def _path(self, lat, lon, suffix=None):
+        name = f"{self.prefix}_{lat}_{lon}"
+        if suffix is not None:
+            name += f"_{suffix}"
+        return CACHE_DIR / f"{name}.json"
 
-    def get(self, lat, lon, kwp, ignore_age=False):
-        path = self._path(lat, lon, kwp)
+    def get(self, lat, lon, suffix=None, ignore_age=False):
+        path = self._path(lat, lon, suffix)
         try:
             if path.exists():
                 cached = json.loads(path.read_text())
@@ -238,8 +273,8 @@ class ForecastCache:
             print(f"Cache read error: {e}", file=sys.stderr)
         return None, False
 
-    def set(self, data, lat, lon, kwp):
-        path = self._path(lat, lon, kwp)
+    def set(self, data, lat, lon, suffix=None):
+        path = self._path(lat, lon, suffix)
         try:
             path.write_text(json.dumps({'cache_timestamp': time.time(), 'data': data}))
         except Exception as e:
@@ -266,7 +301,7 @@ def _next_hour_power(watts_tilted):
     return watts_tilted.get(next_hour.strftime("%Y-%m-%d %H:%M:%S"), 0)
 
 
-def _build_forecast_result(args, watts_tilted):
+def _build_forecast_result(args, watts_tilted, name):
     today = datetime.now().date()
     cutoff = today + timedelta(days=args.show_days)
 
@@ -280,6 +315,7 @@ def _build_forecast_result(args, watts_tilted):
             filtered[ts_str] = w
 
     return {
+        'name': name,
         'watts_tilted': filtered,
         'watt_hours_day': _daily_totals_from_hourly(filtered),
         'current_hour_watts': _next_hour_power(watts_tilted) if args.show_current_hour else None,
@@ -288,14 +324,13 @@ def _build_forecast_result(args, watts_tilted):
 
 # ===== Forecast source: forecast.solar =====
 
-def _fetch_forecast_solar(lat, lon, kwp, cache):
-    cached, is_cached = cache.get(lat, lon, kwp)
+def _fetch_forecast_solar_normalized(lat, lon, cache):
+    """Fetch horizontal irradiance normalized to 1 kWp (tilt=0). Cache is tilt/azimuth/capacity-independent."""
+    cached, is_cached = cache.get(lat, lon)
     if is_cached:
         return cached, True
 
-    # Always fetch at tilt=0 (horizontal). Transposition to actual tilt/azimuth
-    # is done locally via pvlib, keeping the cache key tilt/azimuth-independent.
-    url = f"https://api.forecast.solar/estimate/{lat}/{lon}/0/0/{kwp}"
+    url = f"https://api.forecast.solar/estimate/{lat}/{lon}/0/0/1"
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -307,38 +342,35 @@ def _fetch_forecast_solar(lat, lon, kwp, cache):
         ):
             raise requests.exceptions.RequestException("Rate limit exceeded")
 
-        cache.set(data, lat, lon, kwp)
+        cache.set(data, lat, lon)
         return data, False
 
     except requests.exceptions.RequestException as e:
         if "Rate limit exceeded" in str(e):
             print("# Rate limit exceeded, attempting to use expired cache", file=sys.stderr)
-            cached, is_cached = cache.get(lat, lon, kwp, ignore_age=True)
+            cached, is_cached = cache.get(lat, lon, ignore_age=True)
             if is_cached:
                 return cached, True
         print(f"Error fetching forecast.solar data: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def _transpose_forecast_solar(args, watts_horizontal):
+def _transpose_forecast_solar_string(watts_horizontal, string, location, timezone):
     """
-    Convert horizontal (tilt=0) API watts to actual tilt/azimuth via the
-    pvlib clear-sky transposition ratio:
+    Convert horizontal (tilt=0, per-kWp) API watts to actual tilt/azimuth for one string.
+    Uses pvlib clear-sky transposition ratio:
         ratio[t] = POA_tilted[t] / GHI_clearsky[t]
-        adjusted[t] = watts_horizontal[t] * ratio[t]
+        adjusted[t] = watts_horizontal[t] * ratio[t] * string_capacity
     """
     ts_keys = list(watts_horizontal.keys())
-    times = pd.to_datetime(ts_keys, format="%Y-%m-%d %H:%M:%S").tz_localize(args.timezone)
+    times = pd.to_datetime(ts_keys, format="%Y-%m-%d %H:%M:%S").tz_localize(timezone)
 
-    location = pvlib.location.Location(
-        latitude=args.latitude, longitude=args.longitude, tz=str(args.timezone)
-    )
     clearsky = location.get_clearsky(times, model='ineichen')
     solar_pos = location.get_solarposition(times)
 
     poa = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=args.panel_tilt,
-        surface_azimuth=args.panel_azimuth,
+        surface_tilt=string['tilt'],
+        surface_azimuth=string['azimuth'],
         solar_zenith=solar_pos['apparent_zenith'],
         solar_azimuth=solar_pos['azimuth'],
         dni=clearsky['dni'],
@@ -357,26 +389,33 @@ def _transpose_forecast_solar(args, watts_horizontal):
     watts_series = pd.Series(
         [float(watts_horizontal[k]) for k in ts_keys], index=times
     )
-    adjusted = (watts_series * ratio).clip(lower=0.0).fillna(0.0)
+    adjusted = (watts_series * ratio * string['capacity']).clip(lower=0.0).fillna(0.0)
     return {k: float(adjusted.iloc[i]) for i, k in enumerate(ts_keys)}
 
 
 def run_forecast_solar(args):
     cache = ForecastCache('forecast_solar')
-    data, is_cached = _fetch_forecast_solar(
-        args.latitude, args.longitude, args.system_capacity, cache
-    )
+    data, is_cached = _fetch_forecast_solar_normalized(args.latitude, args.longitude, cache)
     if is_cached:
         print("# Using cached forecast.solar data (less than 1 hour old)", file=sys.stderr)
 
-    watts_tilted = _transpose_forecast_solar(args, data['result']['watts'])
-    return _build_forecast_result(args, watts_tilted)
+    location = pvlib.location.Location(
+        latitude=args.latitude, longitude=args.longitude, tz=str(args.timezone)
+    )
+    results = []
+    for string in args.strings:
+        watts_tilted = _transpose_forecast_solar_string(
+            data['result']['watts'], string, location, args.timezone
+        )
+        results.append(_build_forecast_result(args, watts_tilted, string['name']))
+    return results
 
 
 # ===== Forecast source: Open-Meteo =====
 
-def _fetch_open_meteo(lat, lon, kwp, cache):
-    cached, is_cached = cache.get(lat, lon, kwp)
+def _fetch_open_meteo(lat, lon, cache):
+    """Fetch raw DNI/GHI/DHI weather forecast. Cache key is lat/lon only — independent of string params."""
+    cached, is_cached = cache.get(lat, lon)
     if is_cached:
         return cached, True
 
@@ -390,35 +429,32 @@ def _fetch_open_meteo(lat, lon, kwp, cache):
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-        cache.set(data, lat, lon, kwp)
+        cache.set(data, lat, lon)
         return data, False
     except requests.exceptions.RequestException as e:
         print(f"Error fetching Open-Meteo data: {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def _process_open_meteo(args, raw):
+def _calc_open_meteo_string(raw, string, location, timezone):
     """
-    Apply pvlib transposition directly to Open-Meteo's DNI/GHI/DHI forecast.
+    Apply pvlib transposition to Open-Meteo's DNI/GHI/DHI forecast for one string.
     No approximation needed — real irradiance components are used.
     """
     hourly = raw['hourly']
     times = (pd.to_datetime(hourly['time'])
              .tz_localize('UTC')
-             .tz_convert(args.timezone))
+             .tz_convert(timezone))
 
     ghi = pd.Series(hourly['shortwave_radiation'],      index=times, dtype=float).fillna(0).clip(lower=0)
     dni = pd.Series(hourly['direct_normal_irradiance'], index=times, dtype=float).fillna(0).clip(lower=0)
     dhi = pd.Series(hourly['diffuse_radiation'],        index=times, dtype=float).fillna(0).clip(lower=0)
 
-    location = pvlib.location.Location(
-        latitude=args.latitude, longitude=args.longitude, tz=str(args.timezone)
-    )
     solar_pos = location.get_solarposition(times)
 
     poa = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=args.panel_tilt,
-        surface_azimuth=args.panel_azimuth,
+        surface_tilt=string['tilt'],
+        surface_azimuth=string['azimuth'],
         solar_zenith=solar_pos['apparent_zenith'],
         solar_azimuth=solar_pos['azimuth'],
         dni=dni,
@@ -427,20 +463,24 @@ def _process_open_meteo(args, raw):
     )
 
     # poa_global [W/m²] × system_capacity [kWp] = DC watts (at STC 1000 W/m² reference)
-    watts = (poa['poa_global'] * args.system_capacity).clip(lower=0).fillna(0)
+    watts = (poa['poa_global'] * string['capacity']).clip(lower=0).fillna(0)
     return {ts.strftime("%Y-%m-%d %H:%M:%S"): float(w) for ts, w in watts.items()}
 
 
 def run_forecast_open_meteo(args):
     cache = ForecastCache('open_meteo')
-    data, is_cached = _fetch_open_meteo(
-        args.latitude, args.longitude, args.system_capacity, cache
-    )
+    raw, is_cached = _fetch_open_meteo(args.latitude, args.longitude, cache)
     if is_cached:
         print("# Using cached Open-Meteo data (less than 1 hour old)", file=sys.stderr)
 
-    watts_tilted = _process_open_meteo(args, data)
-    return _build_forecast_result(args, watts_tilted)
+    location = pvlib.location.Location(
+        latitude=args.latitude, longitude=args.longitude, tz=str(args.timezone)
+    )
+    results = []
+    for string in args.strings:
+        watts_tilted = _calc_open_meteo_string(raw, string, location, args.timezone)
+        results.append(_build_forecast_result(args, watts_tilted, string['name']))
+    return results
 
 
 # ===== Forecast source: Solcast =====
@@ -522,7 +562,7 @@ def _fetch_solcast_rooftop(resource_id, api_key):
         sys.exit(1)
 
 
-def _process_solcast_rooftop(args, raw):
+def _process_solcast_rooftop(timezone, raw):
     """
     Convert Solcast pv_estimate (kW per 30-min period) to hourly watts.
     pv_estimate is already computed for the site's tilt/azimuth as registered on
@@ -530,7 +570,7 @@ def _process_solcast_rooftop(args, raw):
     """
     half_hours = []
     for entry in raw['forecasts']:
-        period_end = pd.Timestamp(entry['period_end']).tz_convert(args.timezone)
+        period_end = pd.Timestamp(entry['period_end']).tz_convert(timezone)
         minutes = 60 if entry.get('period') == 'PT60M' else 30
         period_start = period_end - pd.Timedelta(minutes=minutes)
         half_hours.append((period_start, float(entry.get('pv_estimate') or 0)))
@@ -547,31 +587,34 @@ def _process_solcast_rooftop(args, raw):
 
 
 def run_forecast_solcast(args):
-    resource_id = args.solcast_resource_id
-    if not resource_id:
-        sites = _list_solcast_sites(args.solcast_api_key)
-        if not sites:
-            print("Error: No Solcast rooftop sites found. Register one at solcast.com.", file=sys.stderr)
-            sys.exit(1)
-        if len(sites) > 1:
-            site_list = "\n".join(
-                f"  {s['resource_id']}: {s.get('name', '')} ({s.get('location', '')})"
-                for s in sites
-            )
-            print(
-                f"Error: Multiple Solcast sites found. Specify one with --solcast-resource-id "
-                f"or solcast_resource_id in config.cfg:\n{site_list}",
-                file=sys.stderr
-            )
-            sys.exit(1)
-        resource_id = sites[0]['resource_id']
+    results = []
+    for string in args.strings:
+        resource_id = string.get('solcast_resource_id') or args.solcast_resource_id
+        if not resource_id:
+            sites = _list_solcast_sites(args.solcast_api_key)
+            if not sites:
+                print("Error: No Solcast rooftop sites found. Register one at solcast.com.", file=sys.stderr)
+                sys.exit(1)
+            if len(sites) > 1:
+                site_list = "\n".join(
+                    f"  {s['resource_id']}: {s.get('name', '')} ({s.get('location', '')})"
+                    for s in sites
+                )
+                print(
+                    f"Error: Multiple Solcast sites found. Specify solcast_resource_id in "
+                    f"[{string['name']}] config section or via --solcast-resource-id:\n{site_list}",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+            resource_id = sites[0]['resource_id']
 
-    data, is_cached = _fetch_solcast_rooftop(resource_id, args.solcast_api_key)
-    if is_cached:
-        print("# Using cached Solcast data (less than 4 hours old)", file=sys.stderr)
+        data, is_cached = _fetch_solcast_rooftop(resource_id, args.solcast_api_key)
+        if is_cached:
+            print(f"# Using cached Solcast data for {string['name']} (less than 4 hours old)", file=sys.stderr)
 
-    watts_tilted = _process_solcast_rooftop(args, data)
-    return _build_forecast_result(args, watts_tilted)
+        watts_tilted = _process_solcast_rooftop(args.timezone, data)
+        results.append(_build_forecast_result(args, watts_tilted, string['name']))
+    return results
 
 
 # ===== Output formatters =====
@@ -580,124 +623,176 @@ def _label_str(labels):
     return '{' + ','.join(f'{k}="{v}"' for k, v in labels.items()) + '}'
 
 
+def _sum_by_key(dicts):
+    """Sum values across a list of dicts with the same keys."""
+    total = {}
+    for d in dicts:
+        for k, v in d.items():
+            total[k] = total.get(k, 0.0) + v
+    return total
+
+
 def format_human(data, mode, args):
     if mode == 'calculate':
-        points = data if isinstance(data, list) else [data]
-        if len(points) == 1:
-            p = points[0]
-            return tabulate([
-                ["Time", p['timestamp'].strftime('%Y-%m-%d %H:%M %Z')],
-                ["DC Power", f"{p['dc_power_kw']:.2f} kW"],
-                ["POA Irradiance", f"{p['poa_irradiance']:.2f} W/m²"],
-                ["GHI", f"{p['ghi']:.2f} W/m²"],
-            ], tablefmt="simple")
-        rows = [
-            [p['timestamp'].strftime('%Y-%m-%d %H:%M %Z'),
-             f"{p['dc_power_kw']:.2f}",
-             f"{p['poa_irradiance']:.2f}",
-             f"{p['ghi']:.2f}"]
-            for p in points
-        ]
-        return tabulate(rows,
-                        headers=["Time", "DC Power (kW)", "POA Irr (W/m²)", "GHI (W/m²)"],
-                        tablefmt="simple")
-
-    # Forecast mode — hourly table always shown for human format
-    lines = []
-    daily_rows = [[date, f"{int(wh):,}"]
-                  for date, wh in sorted(data['watt_hours_day'].items())]
-    lines.append(tabulate(daily_rows, headers=["Date", "Energy (Wh)"], tablefmt="simple"))
-
-    hourly_rows = []
-    for ts_str, watts in sorted(data['watts_tilted'].items()):
-        try:
-            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        if dt.minute != 0 or dt.second != 0:
-            continue
-        hourly_rows.append([dt.strftime('%Y-%m-%d %H:00'), f"{int(watts):,}"])
-    if hourly_rows:
-        lines.append("")
-        lines.append(tabulate(hourly_rows, headers=["Hour", "Power (W)"], tablefmt="simple"))
-
-    if data['current_hour_watts'] is not None:
-        lines.append(f"\nNext hour: {int(data['current_hour_watts']):,} W")
-
-    return "\n".join(lines)
-
-
-def format_json(data, mode, args):
-    if mode == 'calculate':
-        points = data if isinstance(data, list) else [data]
-        serialised = [{
-            'timestamp': p['timestamp'].strftime('%Y-%m-%d %H:%M %Z'),
-            'dc_power_watts': round(p['dc_power_kw'] * 1000, 2),
-            'poa_irradiance': round(p['poa_irradiance'], 2),
-            'ghi': round(p['ghi'], 2),
-        } for p in points]
-        return json.dumps(serialised[0] if len(serialised) == 1 else serialised, indent=2)
-
-    out = {
-        'watt_hours_day': {k: round(v) for k, v in sorted(data['watt_hours_day'].items())},
-        'watts_tilted': {k: round(v) for k, v in sorted(data['watts_tilted'].items())},
-    }
-    if data['current_hour_watts'] is not None:
-        out['current_hour_watts'] = round(data['current_hour_watts'])
-    return json.dumps(out, indent=2)
-
-
-def format_prometheus(data, mode, args):
-    lines = []
-
-    if mode == 'calculate':
-        points = data if isinstance(data, list) else [data]
-        latest = points[-1]
-        labels = {}
-        if args.shortname:
-            labels['shortname'] = args.shortname
-        labels['plant'] = 'theoretical'
-        labels['capacity'] = str(args.system_capacity)
-        watts = latest['dc_power_kw'] * 1000
-        lines.append(f'theoretical_pv_watts{_label_str(labels)} {watts:.2f}')
+        lines = []
+        for sr in data:
+            if len(data) > 1:
+                lines.append(f"=== {sr['name']} ===")
+            result = sr['result']
+            points = result if isinstance(result, list) else [result]
+            if len(points) == 1:
+                p = points[0]
+                lines.append(tabulate([
+                    ["Time", p['timestamp'].strftime('%Y-%m-%d %H:%M %Z')],
+                    ["DC Power", f"{p['dc_power_kw']:.2f} kW"],
+                    ["POA Irradiance", f"{p['poa_irradiance']:.2f} W/m²"],
+                    ["GHI", f"{p['ghi']:.2f} W/m²"],
+                ], tablefmt="simple"))
+            else:
+                rows = [
+                    [p['timestamp'].strftime('%Y-%m-%d %H:%M %Z'),
+                     f"{p['dc_power_kw']:.2f}",
+                     f"{p['poa_irradiance']:.2f}",
+                     f"{p['ghi']:.2f}"]
+                    for p in points
+                ]
+                lines.append(tabulate(rows,
+                                      headers=["Time", "DC Power (kW)", "POA Irr (W/m²)", "GHI (W/m²)"],
+                                      tablefmt="simple"))
         return "\n".join(lines)
 
-    # Forecast mode — keep metric names identical to original forecast.py
-    lines.append("# HELP solar_forecast_watt_hours_day Forecasted solar energy production in watt-hours per day")
-    lines.append("# TYPE solar_forecast_watt_hours_day gauge")
-    for date, wh in sorted(data['watt_hours_day'].items()):
-        lbls = {'forecast': 'solar'}
-        if args.shortname:
-            lbls['shortname'] = args.shortname
-        lbls['date'] = date
-        lines.append(f'solar_forecast_watt_hours_day{_label_str(lbls)} {round(wh)}')
+    # Forecast mode
+    lines = []
+    for sr in data:
+        if len(data) > 1:
+            lines.append(f"=== {sr['name']} ===")
+        daily_rows = [[date, f"{int(wh):,}"]
+                      for date, wh in sorted(sr['watt_hours_day'].items())]
+        lines.append(tabulate(daily_rows, headers=["Date", "Energy (Wh)"], tablefmt="simple"))
 
-    current_minute = datetime.now().minute
-    hw = args.hourly_window
-    if hw[0] <= current_minute <= hw[1]:
-        lines.append("\n# HELP solar_forecast_hour_watts Forecasted solar power output per hour in watts, labelled by date and hour")
-        lines.append("# TYPE solar_forecast_hour_watts gauge")
-        for ts_str, watts in sorted(data['watts_tilted'].items()):
+        hourly_rows = []
+        for ts_str, watts in sorted(sr['watts_tilted'].items()):
             try:
                 dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
             if dt.minute != 0 or dt.second != 0:
                 continue
-            lbls = {}
-            if args.shortname:
-                lbls['shortname'] = args.shortname
-            lbls['date'] = dt.strftime('%Y-%m-%d')
-            lbls['hour'] = dt.strftime('%H:00')
-            lines.append(f'solar_forecast_hour_watts{_label_str(lbls)} {round(watts)}')
+            hourly_rows.append([dt.strftime('%Y-%m-%d %H:00'), f"{int(watts):,}"])
+        if hourly_rows:
+            lines.append("")
+            lines.append(tabulate(hourly_rows, headers=["Hour", "Power (W)"], tablefmt="simple"))
 
-    if data['current_hour_watts'] is not None:
+        if sr['current_hour_watts'] is not None:
+            lines.append(f"\nNext hour: {int(sr['current_hour_watts']):,} W")
+
+    return "\n".join(lines)
+
+
+def format_json(data, mode, args):
+    def _serialize_calc(sr):
+        result = sr['result']
+        points = result if isinstance(result, list) else [result]
+        serialised = [{
+            'timestamp': p['timestamp'].strftime('%Y-%m-%d %H:%M %Z'),
+            'dc_power_watts': round(p['dc_power_kw'] * 1000, 2),
+            'poa_irradiance': round(p['poa_irradiance'], 2),
+            'ghi': round(p['ghi'], 2),
+        } for p in points]
+        return serialised[0] if len(serialised) == 1 else serialised
+
+    if mode == 'calculate':
+        if len(data) == 1:
+            return json.dumps(_serialize_calc(data[0]), indent=2)
+        return json.dumps({sr['name']: _serialize_calc(sr) for sr in data}, indent=2)
+
+    def _serialize_forecast(sr):
+        out = {
+            'watt_hours_day': {k: round(v) for k, v in sorted(sr['watt_hours_day'].items())},
+            'watts_tilted': {k: round(v) for k, v in sorted(sr['watts_tilted'].items())},
+        }
+        if sr['current_hour_watts'] is not None:
+            out['current_hour_watts'] = round(sr['current_hour_watts'])
+        return out
+
+    if len(data) == 1:
+        return json.dumps(_serialize_forecast(data[0]), indent=2)
+    return json.dumps({sr['name']: _serialize_forecast(sr) for sr in data}, indent=2)
+
+
+def format_prometheus(data, mode, args):
+    lines = []
+    multi = len(data) > 1
+
+    if mode == 'calculate':
+        total_watts = 0.0
+        total_capacity = 0.0
+        for sr in data:
+            result = sr['result']
+            points = result if isinstance(result, list) else [result]
+            watts = points[-1]['dc_power_kw'] * 1000
+            total_watts += watts
+            total_capacity += sr['capacity']
+            lbls = {'string': sr['name'], 'plant': 'theoretical', 'capacity': str(sr['capacity'])}
+            lines.append(f'theoretical_pv_watts{_label_str(lbls)} {watts:.2f}')
+        if multi:
+            lbls = {'string': 'total', 'plant': 'theoretical', 'capacity': str(total_capacity)}
+            lines.append(f'theoretical_pv_watts{_label_str(lbls)} {total_watts:.2f}')
+        return "\n".join(lines)
+
+    # Forecast mode
+    total_watt_hours_day = _sum_by_key([sr['watt_hours_day'] for sr in data])
+    total_watts_tilted = _sum_by_key([sr['watts_tilted'] for sr in data])
+    has_current = any(sr['current_hour_watts'] is not None for sr in data)
+    total_current_hour = sum(sr['current_hour_watts'] or 0 for sr in data)
+
+    lines.append("# HELP solar_forecast_watt_hours_day Forecasted solar energy production in watt-hours per day")
+    lines.append("# TYPE solar_forecast_watt_hours_day gauge")
+    for sr in data:
+        for date, wh in sorted(sr['watt_hours_day'].items()):
+            lbls = {'string': sr['name'], 'forecast': 'solar', 'date': date}
+            lines.append(f'solar_forecast_watt_hours_day{_label_str(lbls)} {round(wh)}')
+    if multi:
+        for date, wh in sorted(total_watt_hours_day.items()):
+            lbls = {'string': 'total', 'forecast': 'solar', 'date': date}
+            lines.append(f'solar_forecast_watt_hours_day{_label_str(lbls)} {round(wh)}')
+
+    current_minute = datetime.now().minute
+    hw = args.hourly_window
+    if hw[0] <= current_minute <= hw[1]:
+        lines.append("\n# HELP solar_forecast_hour_watts Forecasted solar power output per hour in watts, labelled by date and hour")
+        lines.append("# TYPE solar_forecast_hour_watts gauge")
+        for sr in data:
+            for ts_str, watts in sorted(sr['watts_tilted'].items()):
+                try:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt.minute != 0 or dt.second != 0:
+                    continue
+                lbls = {'string': sr['name'], 'date': dt.strftime('%Y-%m-%d'), 'hour': dt.strftime('%H:00')}
+                lines.append(f'solar_forecast_hour_watts{_label_str(lbls)} {round(watts)}')
+        if multi:
+            for ts_str, watts in sorted(total_watts_tilted.items()):
+                try:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if dt.minute != 0 or dt.second != 0:
+                    continue
+                lbls = {'string': 'total', 'date': dt.strftime('%Y-%m-%d'), 'hour': dt.strftime('%H:00')}
+                lines.append(f'solar_forecast_hour_watts{_label_str(lbls)} {round(watts)}')
+
+    if has_current:
         lines.append("\n# HELP solar_forecast_current_hour_watts Forecasted solar power output for the current hour in watts")
         lines.append("# TYPE solar_forecast_current_hour_watts gauge")
-        lbls = {'forecast': 'hourly'}
-        if args.shortname:
-            lbls['shortname'] = args.shortname
-        lines.append(f'solar_forecast_current_hour_watts{_label_str(lbls)} {round(data["current_hour_watts"])}')
+        for sr in data:
+            if sr['current_hour_watts'] is not None:
+                lbls = {'string': sr['name'], 'forecast': 'hourly'}
+                lines.append(f'solar_forecast_current_hour_watts{_label_str(lbls)} {round(sr["current_hour_watts"])}')
+        if multi:
+            lbls = {'string': 'total', 'forecast': 'hourly'}
+            lines.append(f'solar_forecast_current_hour_watts{_label_str(lbls)} {round(total_current_hour)}')
 
     return "\n".join(lines)
 
@@ -720,28 +815,39 @@ def main():
         outputs = []
 
         if args.calculate:
-            if args.now:
-                ts = datetime.now(args.timezone)
-                result = calculate_production(args, ts)
-            elif args.time:
-                ts = datetime.now(args.timezone) if args.time.lower() == 'now' \
-                    else pd.Timestamp(args.time, tz=args.timezone)
-                result = calculate_production(args, ts)
-            else:
-                result = calculate_timeframe_production(args)
-                if not result:
-                    print("No significant production in the specified timeframe.", file=sys.stderr)
-                    sys.exit(0)
-            outputs.append(_render(result, 'calculate', args))
+            string_results = []
+            for string in args.strings:
+                if args.now:
+                    ts = datetime.now(args.timezone)
+                    result = calculate_production(args, ts, string)
+                elif args.time:
+                    ts = datetime.now(args.timezone) if args.time.lower() == 'now' \
+                        else pd.Timestamp(args.time, tz=args.timezone)
+                    result = calculate_production(args, ts, string)
+                else:
+                    result = calculate_timeframe_production(args, string)
+                    if not result:
+                        print(f"No significant production for {string['name']} in the specified timeframe.",
+                              file=sys.stderr)
+                        continue
+                string_results.append({
+                    'name': string['name'],
+                    'capacity': string['capacity'],
+                    'result': result,
+                })
+            if string_results:
+                outputs.append(_render(string_results, 'calculate', args))
+            elif args.timeframe:
+                sys.exit(0)
 
         if args.forecast is not None:
             if args.forecast == 'open-meteo':
-                result = run_forecast_open_meteo(args)
+                results = run_forecast_open_meteo(args)
             elif args.forecast == 'solcast':
-                result = run_forecast_solcast(args)
+                results = run_forecast_solcast(args)
             else:
-                result = run_forecast_solar(args)
-            outputs.append(_render(result, 'forecast', args))
+                results = run_forecast_solar(args)
+            outputs.append(_render(results, 'forecast', args))
 
         print("\n".join(outputs))
 
